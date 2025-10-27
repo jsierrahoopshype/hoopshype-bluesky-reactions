@@ -1,16 +1,11 @@
 import { BskyAgent } from "@atproto/api";
 
 function toRkey(uri) {
-  // at://did:plc:.../app.bsky.feed.post/3lajf... -> rkey at end
   const parts = uri.split("/");
   return parts[parts.length - 1];
 }
-
 function escapeHtml(str="") {
-  return str
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;");
+  return str.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
 }
 
 export default async function handler(req, res) {
@@ -22,8 +17,7 @@ export default async function handler(req, res) {
     }
     if (!q.trim()) return res.status(400).json({ error: "Missing query." });
 
-    const sinceMs = Date.now() - Number(hours) * 3600_000;
-    const sinceIso = new Date(sinceMs).toISOString();
+    const cutoffMs = Date.now() - Number(hours) * 3600_000;
 
     const agent = new BskyAgent({ service: "https://api.bsky.app" });
     await agent.login({
@@ -31,66 +25,59 @@ export default async function handler(req, res) {
       password: process.env.BLUESKY_APP_PASSWORD,
     });
 
-    // Search posts (server-side). Bluesky supports search with filters.
-    // We'll page through results up to `limit`.
-    // API: app.bsky.feed.searchPosts q + since (server may use sortAt/indexedAt).
-    // Docs: https://docs.bsky.app/docs/api/app-bsky-feed-search-posts
-    let cursor = undefined;
-    const out = [];
-    while (out.length < Number(limit)) {
+    // Page through search results (no 'since' due to API behavior), then filter by time locally.
+    let cursor;
+    const scanned = [];
+    while (scanned.length < Number(limit)) {
       const r = await agent.app.bsky.feed.searchPosts({
         q,
         sort: "latest",
-        since: sinceIso,  // server may interpret via sortAt/indexedAt
-        limit: Math.min(25, Number(limit) - out.length),
+        limit: Math.min(25, Number(limit) - scanned.length),
         cursor,
       });
       const batch = r.data?.posts || [];
       if (!batch.length) break;
-      out.push(...batch);
+      scanned.push(...batch);
       cursor = r.data?.cursor;
       if (!cursor) break;
     }
 
-    // Filter and score
     const minR = Number(minReposts);
     const minL = Number(minLikes);
-    const filtered = out
+    const filtered = scanned
       .map(p => {
+        const created = new Date(p.indexedAt || p.record?.createdAt || Date.now());
         const text = p.record?.text || "";
-        const textHtml = escapeHtml(text)
-          .replace(/(https?:\/\/\S+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>');
+        const textHtml = escapeHtml(text).replace(
+          /(https?:\/\/\S+)/g,
+          '<a href="$1" target="_blank" rel="noreferrer">$1</a>'
+        );
         return {
           uri: p.uri,
           rkey: toRkey(p.uri),
           author: p.author,
           text,
           textHtml,
-          indexedAt: p.indexedAt || p.record?.createdAt,
+          indexedAt: created.toISOString(),
+          createdMs: created.getTime(),
           repostCount: p.repostCount || 0,
           likeCount: p.likeCount || 0,
-          url: `https://bsky.app/profile/${p.author?.handle}/post/${toRkey(p.uri)}`,
+          url: `https://bsky.app/profile/${p.author?.handle}/post/${toRkey(p.uri)}`
         };
       })
-      .filter(p => p.repostCount >= minR && p.likeCount >= minL)
+      .filter(p => p.createdMs >= cutoffMs && p.repostCount >= minR && p.likeCount >= minL)
       .sort((a,b) => (b.repostCount + b.likeCount) - (a.repostCount + a.likeCount));
 
-    // Build compact HTML list for Presto paste
-    const itemsHtml = filtered.map(p => {
-      const safe = escapeHtml(p.text);
-      return `
+    const itemsHtml = filtered.map(p => `
 <li>
-  <p><strong>@${p.author?.handle}</strong>: ${safe}</p>
+  <p><strong>@${p.author?.handle}</strong>: ${escapeHtml(p.text)}</p>
   <p><em>Reposts:</em> ${p.repostCount} · <em>Likes:</em> ${p.likeCount} — <a href="${p.url}" target="_blank">link</a></p>
-</li>`;
-    }).join("\n");
-
-    const prepHtml = `<ul>\n${itemsHtml}\n</ul>`;
+</li>`).join("\n");
 
     res.status(200).json({
       count: filtered.length,
       posts: filtered,
-      prepHtml,
+      prepHtml: `<ul>\n${itemsHtml}\n</ul>`
     });
   } catch (e) {
     console.error(e);
